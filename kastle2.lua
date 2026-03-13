@@ -38,8 +38,14 @@ local bpm = 120
 -- Freeze/morph tracking
 local frozen_params = nil  -- stores {fx_index, p1, p2} when frozen
 
--- screen
+-- Screen state variables for design system
+local beat_phase = 0          -- 0-1 for beat pulse animation
+local popup_param = nil       -- currently displayed param name
+local popup_val = nil         -- currently displayed param value
+local popup_time = 0          -- time remaining for popup display
+local popup_duration = 0.8    -- display time in seconds
 local screen_dirty = true
+local screen_clock_id = nil
 
 -- -------------------------------------------------------
 -- SuperCollider engine definition  (goes in Engine_Kastle2.sc)
@@ -220,76 +226,338 @@ local function init_params()
 end
 
 -- -------------------------------------------------------
--- UI
+-- Waveform preview generators (per effect type)
 -- -------------------------------------------------------
+
+-- Generate a delay repeat pattern
+local function draw_delay_waveform(x, y, w, h, param_val)
+  screen.level(8)
+  local samples = w
+  local repeats = 4
+  for i = 1, samples do
+    local norm = (i - 1) / (samples - 1)
+    local repeat_idx = math.floor(norm * repeats)
+    local phase = (norm * repeats) % 1.0
+    local env = math.exp(-phase * 2) -- decay envelope
+    local val = (1 - phase) * env * param_val
+    screen.move(x + i - 1, y + h / 2 - val * h / 2)
+    if i == 1 then
+      screen.move(x + i - 1, y + h / 2)
+    else
+      screen.line_rel(0, -val * h / 2)
+    end
+  end
+  screen.stroke()
+end
+
+-- Generate a filter frequency response curve
+local function draw_filter_waveform(x, y, w, h, param_val)
+  screen.level(8)
+  local samples = w
+  for i = 1, samples do
+    local norm = (i - 1) / (samples - 1)
+    local freq_norm = norm ^ 2  -- log frequency response
+    local response = (1 - freq_norm * param_val) * 0.8 + 0.2
+    local height = response * h
+    screen.move(x + i - 1, y + h - height)
+    if i == 1 then
+      screen.move(x + i - 1, y + h - height)
+    else
+      screen.line_rel(0, height)
+    end
+  end
+  screen.stroke()
+end
+
+-- Generate an LFO waveform
+local function draw_lfo_waveform(x, y, w, h, param_val)
+  screen.level(8)
+  local samples = w
+  local cycles = 2 + param_val * 3
+  for i = 1, samples do
+    local norm = (i - 1) / (samples - 1)
+    local phase = norm * cycles * math.pi * 2
+    local val = math.sin(phase) * 0.5 + 0.5
+    local height = val * h
+    screen.move(x + i - 1, y + h / 2 + (val - 0.5) * h / 2)
+    if i == 1 then
+      screen.move(x + i - 1, y + h / 2 + (val - 0.5) * h / 2)
+    else
+      screen.line_rel(0, (val - 0.5) * h / 2)
+    end
+  end
+  screen.stroke()
+end
+
+-- Select waveform based on effect type
+local function draw_waveform_preview(x, y, w, h)
+  local fx = FX_MODES[fx_index]
+  
+  if fx == "delay" then
+    draw_delay_waveform(x, y, w, h, p1)
+  elseif fx == "flanger" or fx == "panner" or fx == "modulation" then
+    draw_lfo_waveform(x, y, w, h, p1)
+  elseif fx == "pitcher" or fx == "shifter" then
+    draw_lfo_waveform(x, y, w, h, p2)
+  else
+    -- Generic waveform for other effects
+    draw_lfo_waveform(x, y, w, h, 0.5)
+  end
+end
+
+-- -------------------------------------------------------
+-- Parameter arc drawing (dial faces)
+-- -------------------------------------------------------
+
+-- Draw a single parameter arc
+local function draw_param_arc(cx, cy, radius, param_val, is_active)
+  local level = is_active and 15 or 8
+  screen.level(level)
+  screen.aa(1)
+  
+  -- Draw background circle (dim)
+  screen.level(is_active and 6 or 3)
+  screen.circle(cx, cy, radius)
+  screen.stroke()
+  
+  -- Draw value sweep (bright)
+  screen.level(level)
+  local start_angle = -2.4  -- about -140 degrees
+  local sweep_range = 4.8   -- about 280 degrees total arc
+  local end_angle = start_angle + (param_val * sweep_range)
+  
+  screen.arc(cx, cy, radius, start_angle, end_angle)
+  screen.stroke()
+  
+  -- Draw center dot
+  screen.level(level)
+  screen.circle(cx, cy, 1)
+  screen.fill()
+end
+
+-- Draw the live zone with 2-3 parameter arcs
+local function draw_live_zone()
+  -- Layout: 2-3 arcs arranged horizontally in the live zone (y 9-52)
+  local zone_y_start = 9
+  local zone_y_end = 52
+  local zone_height = zone_y_end - zone_y_start
+  local zone_center_y = zone_y_start + zone_height / 2
+  
+  local radius = 14
+  local arc1_x = 24
+  local arc2_x = 64
+  local arc3_x = 104
+  
+  -- First arc: P1 (always active)
+  draw_param_arc(arc1_x, zone_center_y, radius, p1, true)
+  screen.level(10)
+  screen.font_size(6)
+  screen.move(arc1_x, zone_center_y + radius + 8)
+  screen.text_center("P1")
+  
+  -- Second arc: P2 (always active)
+  draw_param_arc(arc2_x, zone_center_y, radius, p2, true)
+  screen.level(10)
+  screen.font_size(6)
+  screen.move(arc2_x, zone_center_y + radius + 8)
+  screen.text_center("P2")
+  
+  -- Small waveform preview in the bottom right of live zone
+  draw_waveform_preview(95, 38, 32, 10)
+end
+
+-- -------------------------------------------------------
+-- Status strip (top, y 0-8)
+-- -------------------------------------------------------
+
+local function draw_status_strip()
+  screen.level(4)
+  screen.font_size(6)
+  screen.move(0, 7)
+  screen.text("KASTLE2")
+  
+  -- Current effect name (highlighted, centered)
+  screen.level(15)
+  screen.font_size(8)
+  screen.move(64, 7)
+  screen.text_center(string.upper(FX_MODES[fx_index]))
+  
+  -- Beat pulse dot at x=124
+  local pulse_brightness = math.floor(8 + beat_phase * 7)  -- 8-15 range
+  screen.level(pulse_brightness)
+  screen.circle(124, 4, 1.5)
+  screen.fill()
+end
+
+-- -------------------------------------------------------
+-- Effect browser (scrolling effect list)
+-- -------------------------------------------------------
+
+local function draw_effect_browser()
+  local prev_idx = fx_index - 1
+  if prev_idx < 1 then prev_idx = #FX_MODES end
+  
+  local next_idx = fx_index + 1
+  if next_idx > #FX_MODES then next_idx = 1 end
+  
+  -- Previous effect (dim)
+  screen.level(4)
+  screen.font_size(7)
+  screen.move(64, 25)
+  screen.text_center(string.upper(FX_MODES[prev_idx]))
+  
+  -- Current effect (bright)
+  screen.level(15)
+  screen.font_size(9)
+  screen.move(64, 32)
+  screen.text_center(string.upper(FX_MODES[fx_index]))
+  
+  -- Next effect (dim)
+  screen.level(4)
+  screen.font_size(7)
+  screen.move(64, 40)
+  screen.text_center(string.upper(FX_MODES[next_idx]))
+end
+
+-- -------------------------------------------------------
+-- Context bar (bottom, y 53-58)
+-- -------------------------------------------------------
+
+local function draw_context_bar()
+  screen.level(5)
+  screen.font_size(6)
+  
+  -- TAP tempo display
+  screen.move(2, 57)
+  screen.text(string.format("TAP %3d", math.floor(bpm)))
+  
+  -- DJ filter state (placeholder)
+  screen.level(5)
+  screen.move(40, 57)
+  screen.text("FILTER")
+  
+  -- MIDI info placeholder
+  screen.level(4)
+  screen.move(85, 57)
+  screen.text("MIDI")
+end
+
+-- -------------------------------------------------------
+-- Transient parameter popup (overlay)
+-- -------------------------------------------------------
+
+local function draw_popup_param()
+  if popup_time > 0 then
+    -- Draw semi-transparent background
+    screen.level(2)
+    screen.rect(30, 20, 68, 20)
+    screen.fill()
+    
+    -- Border
+    screen.level(15)
+    screen.rect(30, 20, 68, 20)
+    screen.stroke()
+    
+    -- Parameter name
+    screen.level(15)
+    screen.font_size(7)
+    screen.move(64, 26)
+    if popup_param then
+      screen.text_center(string.upper(popup_param))
+    end
+    
+    -- Parameter value
+    screen.level(15)
+    screen.font_size(8)
+    screen.move(64, 36)
+    if popup_val then
+      screen.text_center(string.format("%.2f", popup_val))
+    end
+  end
+end
+
+-- -------------------------------------------------------
+-- Main redraw function
+-- -------------------------------------------------------
+
 local function draw_screen()
   screen.clear()
   screen.aa(1)
-
-  -- title bar
-  screen.level(15)
-  screen.font_face(1)
-  screen.font_size(8)
-  screen.move(0, 8)
-  screen.text("kastle2")
-
-  -- fx mode name (large)
-  screen.level(15)
-  screen.font_size(16)
-  screen.move(64, 30)
-  screen.text_center(FX_MODES[fx_index])
-
-  -- fx number dots
-  local dot_x = 8
-  for i = 1, #FX_MODES do
-    if i == fx_index then
-      screen.level(15)
-      screen.circle(dot_x, 55, 3)
-      screen.fill()
-    else
-      screen.level(4)
-      screen.circle(dot_x, 55, 2)
-      screen.stroke()
-    end
-    dot_x = dot_x + 14
-  end
-
-  -- p1 bar (left)
-  screen.level(6)
-  screen.rect(0, 36, 4, 16)
-  screen.stroke()
-  screen.level(15)
-  screen.rect(0, 36 + math.floor((1 - p1) * 16), 4, math.ceil(p1 * 16))
-  screen.fill()
-
-  -- p2 bar (right)
-  screen.level(6)
-  screen.rect(124, 36, 4, 16)
-  screen.stroke()
-  screen.level(15)
-  screen.rect(124, 36 + math.floor((1 - p2) * 16), 4, math.ceil(p2 * 16))
-  screen.fill()
-
-  -- frozen indicator
+  
+  -- Status strip (y 0-8)
+  draw_status_strip()
+  
+  -- Live zone (y 9-52) with parameter arcs and waveform
+  draw_live_zone()
+  
+  -- Context bar (y 53-58)
+  draw_context_bar()
+  
+  -- Frozen indicator overlay
   if frozen_params ~= nil then
-    screen.level(10)
+    screen.level(12)
     screen.font_size(6)
-    screen.move(64, 10)
+    screen.move(64, 16)
     screen.text_center("[FROZEN]")
   end
-
-  -- bpm (small, top right)
-  screen.level(4)
-  screen.font_size(7)
-  screen.move(128, 8)
-  screen.text_right(string.format("%d bpm", math.floor(bpm)))
-
+  
+  -- Transient parameter popup
+  draw_popup_param()
+  
   screen.update()
+end
+
+-- -------------------------------------------------------
+-- Screen update clock (~10fps for animations)
+-- -------------------------------------------------------
+
+local function start_screen_clock()
+  if screen_clock_id then
+    clock.cancel(screen_clock_id)
+  end
+  
+  screen_clock_id = clock.run(function()
+    local frame_time = 1 / 10  -- 10fps for smooth animations
+    while true do
+      -- Update beat phase (simple sawtooth 0-1)
+      beat_phase = (beat_phase + frame_time / 0.5) % 1.0
+      
+      -- Update popup timer
+      if popup_time > 0 then
+        popup_time = popup_time - frame_time
+        if popup_time <= 0 then
+          popup_time = 0
+          popup_param = nil
+          popup_val = nil
+        end
+      end
+      
+      -- Redraw if dirty or if animations are running
+      if screen_dirty or popup_time > 0 then
+        draw_screen()
+        screen_dirty = false
+      end
+      
+      clock.sleep(frame_time)
+    end
+  end)
+end
+
+-- -------------------------------------------------------
+-- Show popup for parameter change
+-- -------------------------------------------------------
+
+local function show_popup(param_name, param_value)
+  popup_param = param_name
+  popup_val = param_value
+  popup_time = popup_duration
+  screen_dirty = true
 end
 
 -- -------------------------------------------------------
 -- Lifecycle
 -- -------------------------------------------------------
+
 function init()
   init_params()
   params:read()
@@ -297,37 +565,36 @@ function init()
 
   send_params()
 
-  -- redraw clock
-  clock.run(function()
-    while true do
-      clock.sleep(1/30)
-      if screen_dirty then
-        draw_screen()
-        screen_dirty = false
-      end
-    end
-  end)
+  -- Start the screen clock for animations
+  start_screen_clock()
 
   print("kastle2: ready — " .. #FX_MODES .. " fx modes loaded")
 end
 
 function cleanup()
   params:write()
+  if screen_clock_id then
+    clock.cancel(screen_clock_id)
+  end
 end
 
 -- -------------------------------------------------------
 -- Encoders
 -- -------------------------------------------------------
+
 function enc(n, d)
   if n == 1 then
     fx_index = util.clamp(fx_index + d, 1, #FX_MODES)
     engine.mode(fx_index - 1)
+    show_popup("FX", fx_index)
   elseif n == 2 then
     p1 = util.clamp(p1 + d * 0.01, 0, 1)
     engine.p1(p1)
+    show_popup("P1", p1)
   elseif n == 3 then
     p2 = util.clamp(p2 + d * 0.01, 0, 1)
     engine.p2(p2)
+    show_popup("P2", p2)
   end
   screen_dirty = true
 end
@@ -335,6 +602,7 @@ end
 -- -------------------------------------------------------
 -- Keys
 -- -------------------------------------------------------
+
 local k1_down = false
 local k2_down_time = nil
 

@@ -6,7 +6,8 @@
 -- E2 : param 1 (mix / time / rate)
 -- E3 : param 2 (feedback / depth / pitch)
 -- K2 : hold = tap tempo
--- K3 : toggle freeze / latch
+-- K1+K2 : random patch generator
+-- K1+K3 : freeze/unfreeze current parameters
 --
 -- params menu: input level, output level,
 --              filter (lp/hp), filter freq,
@@ -33,6 +34,9 @@ local p2 = 0.5   -- feedback / depth / pitch
 local frozen = false
 local tap_times = {}
 local bpm = 120
+
+-- Freeze/morph tracking
+local frozen_params = nil  -- stores {fx_index, p1, p2} when frozen
 
 -- screen
 local screen_dirty = true
@@ -120,6 +124,44 @@ local function send_params()
   engine.mode(fx_index - 1)
   engine.p1(p1)
   engine.p2(p2)
+end
+
+-- -------------------------------------------------------
+-- Random patch generator
+-- -------------------------------------------------------
+local function random_patch()
+  -- Pick a random FX mode
+  fx_index = math.random(1, #FX_MODES)
+  
+  -- Randomize p1 and p2 within valid 0–1 range
+  p1 = math.random(0, 100) / 100.0
+  p2 = math.random(0, 100) / 100.0
+  
+  -- Send to engine
+  send_params()
+  
+  -- Visual feedback
+  screen_dirty = true
+end
+
+-- -------------------------------------------------------
+-- Freeze / Morph
+-- -------------------------------------------------------
+local function toggle_freeze()
+  if frozen_params == nil then
+    -- Capture current state
+    frozen_params = {
+      fx_index = fx_index,
+      p1 = p1,
+      p2 = p2,
+    }
+    print("kastle2: frozen patch captured")
+  else
+    -- Release freeze
+    frozen_params = nil
+    print("kastle2: freeze released")
+  end
+  screen_dirty = true
 end
 
 -- -------------------------------------------------------
@@ -229,11 +271,11 @@ local function draw_screen()
   screen.fill()
 
   -- frozen indicator
-  if frozen then
-    screen.level(15)
-    screen.font_size(8)
+  if frozen_params ~= nil then
+    screen.level(10)
+    screen.font_size(6)
     screen.move(64, 10)
-    screen.text_center("[freeze]")
+    screen.text_center("[FROZEN]")
   end
 
   -- bpm (small, top right)
@@ -293,22 +335,34 @@ end
 -- -------------------------------------------------------
 -- Keys
 -- -------------------------------------------------------
+local k1_down = false
 local k2_down_time = nil
 
 function key(n, z)
-  if n == 2 then
+  if n == 1 then
+    k1_down = (z == 1)
+  elseif n == 2 then
     if z == 1 then
-      k2_down_time = util.time()
-    else
-      local held = util.time() - (k2_down_time or 0)
-      if held < 0.4 then
-        tap()
+      -- Check for K1+K2 (random patch)
+      if k1_down then
+        random_patch()
+      else
+        k2_down_time = util.time()
       end
-      k2_down_time = nil
+    else
+      -- K2 release: tap tempo if not held too long
+      if k2_down_time ~= nil then
+        local held = util.time() - k2_down_time
+        if held < 0.4 then
+          tap()
+        end
+        k2_down_time = nil
+      end
     end
   elseif n == 3 and z == 1 then
-    frozen = not frozen
-    engine.frozen(frozen and 1 or 0)
-    screen_dirty = true
+    -- Check for K1+K3 (freeze toggle)
+    if k1_down then
+      toggle_freeze()
+    end
   end
 end

@@ -106,6 +106,8 @@ function init()
     params:set_action("save_fav_"..i, function() save_favorite(i) end)
   end
 
+  -- Set initial dirty flag
+  dirty = true
   redraw()
 end
 
@@ -275,7 +277,9 @@ function grid_key(x, y, z)
   end
 end
 
-g.key = grid_key
+if g and g.device then
+  g.key = grid_key
+end
 
 -- ─── MIDI CC LEARN ────────────────────────────────────────────
 function midi_handler(data)

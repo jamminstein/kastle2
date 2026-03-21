@@ -235,10 +235,15 @@ end
 
 -- ─── KEY CONTROL ──────────────────────────────────────────────
 function key(n, z)
-  if n == 1 and z == 1 then
-    -- K1: favorite mode manager
-    show_popup("SELECT FAVORITE")
+  if n == 1 then
+    k1_held = (z == 1)
+    return
   elseif n == 2 and z == 1 then
+    if k1_held then
+      -- K1+K2: favorite mode manager
+      show_popup("SELECT FAVORITE")
+      return
+    end
     -- K2: previous mode
     state.mode = ((state.mode - 2) % 9) + 1
     mark_redraw()

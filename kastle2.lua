@@ -91,6 +91,12 @@ function send_filter(val)
   engine.filter_freq(dj_filter_freq(val))
 end
 
+-- ─── REDRAW MANAGEMENT ────────────────────────────────────────
+local dirty = true
+local function mark_redraw()
+  dirty = true
+end
+
 -- ─── INITIALIZATION ───────────────────────────────────────────
 function init()
   -- Initialize effect parameters for all 9 modes
@@ -162,12 +168,6 @@ function init()
   -- Set initial dirty flag
   dirty = true
   redraw()
-end
-
--- ─── REDRAW MANAGEMENT ────────────────────────────────────────
-local dirty = true
-function mark_redraw()
-  dirty = true
 end
 
 -- ─── EFFECT MODE DISPLAY ──────────────────────────────────────

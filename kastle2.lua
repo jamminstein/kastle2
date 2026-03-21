@@ -12,7 +12,7 @@
 --
 -- grid: 16 touch-sensitive pads for effect selection & MIDI CC learn
 --
-engine.name = "PolyPerc"
+engine.name = "Kastle2"
 
 local MusicUtil = require "musicutil"
 
@@ -51,6 +51,45 @@ local g = grid.connect()
 local popup_time = 0
 local popup_msg = ""
 local beat_phase = 0
+
+-- ─── ENGINE HELPERS ──────────────────────────────────────────
+-- Map 0-1 DJ filter knob to frequency + mode.
+-- Center (0.5) = filter off. Left of center = LP sweep down.
+-- Right of center = HP sweep up. Exponential mapping 20-20000 Hz.
+function dj_filter_freq(val)
+  if val < 0.5 then
+    -- LP: 0.0 -> 20 Hz, 0.5 -> 20000 Hz
+    local t = val / 0.5
+    return 20 * (1000 ^ t)  -- 20 to 20000
+  else
+    -- HP: 0.5 -> 20 Hz, 1.0 -> 20000 Hz
+    local t = (val - 0.5) / 0.5
+    return 20 * (1000 ^ t)
+  end
+end
+
+function dj_filter_mode(val)
+  if val < 0.48 then return 1     -- LP
+  elseif val > 0.52 then return 2 -- HP
+  else return 0 end               -- off (center dead-zone)
+end
+
+-- Send current mode + params to the SC engine
+function send_mode()
+  engine.mode(state.mode - 1) -- SC is 0-indexed
+end
+
+function send_params()
+  local p = state.effect_params[state.mode]
+  engine.p1(p[1])
+  engine.p2(p[2])
+  send_filter(p[3])
+end
+
+function send_filter(val)
+  engine.filter_mode(dj_filter_mode(val))
+  engine.filter_freq(dj_filter_freq(val))
+end
 
 -- ─── INITIALIZATION ───────────────────────────────────────────
 function init()
@@ -91,6 +130,13 @@ function init()
         controlspec.new(0, 1, 'lin', 0.01, 0.5))
       params:set_action("e"..i.."_p"..j, function(v)
         state.effect_params[i][j] = v
+        -- Send to engine if this is the active mode
+        if i == state.mode then
+          if j == 1 then engine.p1(v)
+          elseif j == 2 then engine.p2(v)
+          elseif j == 3 then send_filter(v)
+          end
+        end
         mark_redraw()
       end)
     end
@@ -105,6 +151,13 @@ function init()
     params:add_trigger("save_fav_"..i, "Save FAV" .. i)
     params:set_action("save_fav_"..i, function() save_favorite(i) end)
   end
+
+  -- Send initial state to SC engine
+  engine.in_level(1.0)
+  engine.out_level(1.0)
+  engine.tempo(clock.get_tempo())
+  send_mode()
+  send_params()
 
   -- Set initial dirty flag
   dirty = true
@@ -219,6 +272,8 @@ function enc(n, d)
     -- E1: rotate to navigate modes
     state.mode = ((state.mode - 1 + d) % 9) + 1
     state.param_index = 1
+    send_mode()
+    send_params()
     mark_redraw()
   elseif n == 2 then
     -- E2: navigate parameters
@@ -226,9 +281,13 @@ function enc(n, d)
     mark_redraw()
   elseif n == 3 then
     -- E3: adjust parameter value
-    local effect = effects[state.mode]
     local idx = state.param_index
-    state.effect_params[state.mode][idx] = util.clamp(state.effect_params[state.mode][idx] + d * 0.01, 0, 1)
+    local new_val = util.clamp(state.effect_params[state.mode][idx] + d * 0.01, 0, 1)
+    state.effect_params[state.mode][idx] = new_val
+    if idx == 1 then engine.p1(new_val)
+    elseif idx == 2 then engine.p2(new_val)
+    elseif idx == 3 then send_filter(new_val)
+    end
     mark_redraw()
   end
 end
@@ -246,10 +305,14 @@ function key(n, z)
     end
     -- K2: previous mode
     state.mode = ((state.mode - 2) % 9) + 1
+    send_mode()
+    send_params()
     mark_redraw()
   elseif n == 3 and z == 1 then
     -- K3: next mode
     state.mode = (state.mode % 9) + 1
+    send_mode()
+    send_params()
     mark_redraw()
   end
 end
@@ -262,6 +325,8 @@ function grid_key(x, y, z)
       local mode_idx = (y - 1) * 3 + x
       if mode_idx >= 1 and mode_idx <= 9 then
         state.mode = mode_idx
+        send_mode()
+        send_params()
         mark_redraw()
       end
     elseif y == 4 then
@@ -312,6 +377,8 @@ function load_favorite(slot)
   if fav then
     state.mode = fav.mode
     state.effect_params[state.mode] = {fav.params[1], fav.params[2], fav.params[3]}
+    send_mode()
+    send_params()
     show_popup("LOADED " .. favorite_names[slot])
     mark_redraw()
   end
@@ -322,6 +389,11 @@ function show_popup(msg)
   popup_msg = msg
   popup_time = 60  -- ~4s at 15 FPS
   mark_redraw()
+end
+
+-- ─── TEMPO SYNC ─────────────────────────────────────────────
+clock.transport.tempo_change = function(bpm)
+  engine.tempo(bpm)
 end
 
 function cleanup()

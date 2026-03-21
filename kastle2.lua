@@ -16,6 +16,8 @@ engine.name = "Kastle2"
 
 local MusicUtil = require "musicutil"
 
+local screen_clock_id = nil
+
 -- State structure
 local state = {
   mode = 1,
@@ -116,7 +118,7 @@ function init()
   end
 
   -- Screen refresh clock
-  clock.run(function()
+  screen_clock_id = clock.run(function()
     while true do
       clock.sleep(1/15)
       beat_phase = (beat_phase + 1) % 240
@@ -397,7 +399,7 @@ clock.transport.tempo_change = function(bpm)
 end
 
 function cleanup()
-  clock.cancel_all()
+  if screen_clock_id then clock.cancel(screen_clock_id) end
   if state.midi_device then
     state.midi_device.event = nil
   end

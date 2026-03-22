@@ -1,406 +1,600 @@
--- kastle2 for norns
+-- kastle2: bastl kastle-inspired synthesizer
+-- norns port with sequencer, lfo, dj filter
 --
--- a norns port of the bastl instruments kastle 2 fx wizard
--- 9 real-time effects + visual feedback
---
--- k1: shift (hold)
--- k2: prev mode
--- k3: next mode
--- e1: select effect parameter
--- e2/e3: adjust effect values
--- enc(1) rotated 2x: toggle favorite mode save/load
---
--- grid: 16 touch-sensitive pads for effect selection & MIDI CC learn
---
-engine.name = "Kastle2"
+-- E1 mode select (1-9)
+-- E2 param 1 (per mode)
+-- E3 param 2 (per mode)
+-- K2 play/stop
+-- K3 randomize sequence
+-- K1+E2 lfo rate
+-- K1+E3 dj filter
+-- K1+K2 save favorite
+-- K1+K3 load next favorite
 
-local MusicUtil = require "musicutil"
-
-local screen_clock_id = nil
-
--- State structure
-local state = {
-  mode = 1,
-  effect_params = {},
-  fav_modes = {},
-  param_index = 1,
-  fav_learn_mode = false,
-  fav_learn_cc = nil,
-  midi_device = nil,
-}
-
--- Effect list: 9 audio effects
-local effects = {
-  { name = "DELAY", params = {"time", "feedback", "mix"} },
-  { name = "FLANGER", params = {"rate", "depth", "feedback"} },
-  { name = "FREEZER", params = {"buffer_size", "freeze_rate", "mix"} },
-  { name = "PANNER", params = {"rate", "depth", "mix"} },
-  { name = "CRUSHER", params = {"bits", "rate", "mix"} },
-  { name = "SLICER", params = {"rate", "depth", "mix"} },
-  { name = "PITCHER", params = {"shift", "formant", "mix"} },
-  { name = "REPLAYER", params = {"playback_rate", "reverse", "mix"} },
-  { name = "SHIFTER", params = {"pitch_shift", "feedback", "mix"} }
-}
-
--- Favorite slots
-local favorite_names = {"FAV1", "FAV2", "FAV3", "FAV4"}
-local selected_fav = 1
-
--- Grid connection
+engine.name = "PolyPerc"
+local musicutil = require "musicutil"
 local g = grid.connect()
 
--- Screen state
-local popup_time = 0
-local popup_msg = ""
-local beat_phase = 0
+-- state
+local MODE_NAMES = {
+  "PHASE DIST", "FM BELL", "FORMANT", "NOISE",
+  "WAVEFOLD", "RING MOD", "SUBHARM", "CHAOS", "DRONE"
+}
+local MODE_P1 = {
+  "pitch", "ratio", "formant", "color",
+  "fold", "ring freq", "sub div", "rate", "detune"
+}
+local MODE_P2 = {
+  "depth", "decay", "resonance", "density",
+  "drive", "mix", "octave", "feedback", "spread"
+}
 
--- ─── ENGINE HELPERS ──────────────────────────────────────────
--- Map 0-1 DJ filter knob to frequency + mode.
--- Center (0.5) = filter off. Left of center = LP sweep down.
--- Right of center = HP sweep up. Exponential mapping 20-20000 Hz.
-function dj_filter_freq(val)
-  if val < 0.5 then
-    -- LP: 0.0 -> 20 Hz, 0.5 -> 20000 Hz
-    local t = val / 0.5
-    return 20 * (1000 ^ t)  -- 20 to 20000
+local mode = 1
+local param1 = 50
+local param2 = 50
+local playing = false
+local step = 1
+local k1_held = false
+local beat_flash = 0
+
+-- sequencer
+local seq_pitch = {0, 3, 5, 7, 10, 12, 7, 5}
+local seq_gate = {1, 1, 1, 1, 1, 1, 1, 1}
+local seq_root = 48
+local seq_rate = 3
+local RATE_NAMES = {"1/4", "1/8", "1/16", "1/32"}
+local RATE_DIVS = {1, 0.5, 0.25, 0.125}
+
+-- lfo
+local lfo_shape = 1
+local lfo_rate = 2.0
+local lfo_depth = 50
+local lfo_phase = 0
+local LFO_SHAPES = {"sine", "tri", "saw", "sqr"}
+
+-- dj filter
+local dj_filter = 50
+
+-- favorites
+local favorites = {}
+local fav_slot = 1
+
+-- midi
+local midi_out_device = nil
+local midi_out_channel = 1
+local opxy_device = nil
+local opxy_channel = 2
+
+-- clock ids
+local clock_ids = {}
+
+-- grid state
+local grid_connected = false
+
+------------------------------------------------------------
+-- MODE ENGINE CONFIGS
+------------------------------------------------------------
+
+local function apply_mode()
+  local cutoffs = {1200, 3000, 800, 6000, 1500, 2000, 600, 4000, 500}
+  local releases = {0.3, 1.5, 0.4, 0.1, 0.5, 0.6, 0.8, 0.2, 3.0}
+  local pws = {0.5, 0.3, 0.7, 0.5, 0.2, 0.4, 0.6, 0.1, 0.5}
+
+  local c = cutoffs[mode] or 1200
+  local r = releases[mode] or 0.5
+  local pw = pws[mode] or 0.5
+
+  -- param1 modulates cutoff
+  local p1_mod = (param1 / 100)
+  c = c * (0.3 + p1_mod * 1.4)
+
+  -- param2 modulates release and pw
+  local p2_mod = (param2 / 100)
+  r = r * (0.2 + p2_mod * 2.0)
+  pw = util.clamp(pw + (p2_mod - 0.5) * 0.4, 0.05, 0.95)
+
+  engine.cutoff(util.clamp(c, 60, 18000))
+  engine.release(util.clamp(r, 0.01, 5.0))
+  engine.pw(pw)
+  engine.amp(0.6)
+end
+
+------------------------------------------------------------
+-- LFO
+------------------------------------------------------------
+
+local function lfo_value()
+  local p = lfo_phase
+  if lfo_shape == 1 then
+    return math.sin(p * 2 * math.pi)
+  elseif lfo_shape == 2 then
+    if p < 0.5 then return p * 4 - 1
+    else return 3 - p * 4 end
+  elseif lfo_shape == 3 then
+    return p * 2 - 1
   else
-    -- HP: 0.5 -> 20 Hz, 1.0 -> 20000 Hz
-    local t = (val - 0.5) / 0.5
-    return 20 * (1000 ^ t)
+    if p < 0.5 then return 1 else return -1 end
   end
 end
 
-function dj_filter_mode(val)
-  if val < 0.48 then return 1     -- LP
-  elseif val > 0.52 then return 2 -- HP
-  else return 0 end               -- off (center dead-zone)
-end
-
--- Send current mode + params to the SC engine
-function send_mode()
-  engine.mode(state.mode - 1) -- SC is 0-indexed
-end
-
-function send_params()
-  local p = state.effect_params[state.mode]
-  engine.p1(p[1])
-  engine.p2(p[2])
-  send_filter(p[3])
-end
-
-function send_filter(val)
-  engine.filter_mode(dj_filter_mode(val))
-  engine.filter_freq(dj_filter_freq(val))
-end
-
--- ─── REDRAW MANAGEMENT ────────────────────────────────────────
-local dirty = true
-local function mark_redraw()
-  dirty = true
-end
-
--- ─── INITIALIZATION ───────────────────────────────────────────
-function init()
-  -- Initialize effect parameters for all 9 modes
-  for i = 1, 9 do
-    state.effect_params[i] = {0.5, 0.5, 0.5}
-  end
-
-  -- Initialize 4 favorite slots with default values
-  for i = 1, 4 do
-    state.fav_modes[i] = {mode = i, params = {0.5, 0.5, 0.5}}
-  end
-
-  -- MIDI setup
-  state.midi_device = midi.connect(1)
-  state.midi_device.event = function(data)
-    midi_handler(data)
-  end
-
-  -- Screen refresh clock
-  screen_clock_id = clock.run(function()
-    while true do
-      clock.sleep(1/15)
-      beat_phase = (beat_phase + 1) % 240
-      popup_time = math.max(0, popup_time - 1)
-      redraw()
+local function run_lfo()
+  while true do
+    clock.sleep(1 / 30)
+    lfo_phase = lfo_phase + (lfo_rate / 30)
+    if lfo_phase >= 1 then lfo_phase = lfo_phase - 1 end
+    -- apply lfo to cutoff
+    local base_cut = 1200
+    local mod = lfo_value() * (lfo_depth / 100) * 2000
+    local dj = (dj_filter - 50) / 50
+    local dj_mod = 0
+    if dj < 0 then
+      dj_mod = dj * 4000
+    elseif dj > 0 then
+      dj_mod = dj * 6000
     end
-  end)
+    engine.cutoff(util.clamp(base_cut + mod + dj_mod, 60, 18000))
+  end
+end
 
-  -- Parameters for external control mapping
-  params:add_separator("kastle2_effects", "KASTLE2 EFFECTS")
+------------------------------------------------------------
+-- SEQUENCER
+------------------------------------------------------------
 
-  for i = 1, 9 do
-    local effect_name = effects[i].name
-    params:add_group(effect_name, 3)
-    for j, param_name in ipairs(effects[i].params) do
-      params:add_control("e"..i.."_p"..j, param_name,
-        controlspec.new(0, 1, 'lin', 0.01, 0.5))
-      params:set_action("e"..i.."_p"..j, function(v)
-        state.effect_params[i][j] = v
-        -- Send to engine if this is the active mode
-        if i == state.mode then
-          if j == 1 then engine.p1(v)
-          elseif j == 2 then engine.p2(v)
-          elseif j == 3 then send_filter(v)
-          end
-        end
-        mark_redraw()
+local function note_hz(note_num)
+  return musicutil.note_num_to_freq(note_num)
+end
+
+local function play_step()
+  if seq_gate[step] == 1 then
+    local nn = seq_root + seq_pitch[step]
+    local hz = note_hz(nn)
+    apply_mode()
+    engine.hz(hz)
+    -- midi out
+    if midi_out_device then
+      midi_out_device:note_on(nn, 100, midi_out_channel)
+      clock.run(function()
+        clock.sleep(0.05)
+        midi_out_device:note_off(nn, 0, midi_out_channel)
+      end)
+    end
+    -- op-xy out
+    if opxy_device then
+      opxy_device:note_on(nn, 100, opxy_channel)
+      clock.run(function()
+        clock.sleep(0.05)
+        opxy_device:note_off(nn, 0, opxy_channel)
       end)
     end
   end
-
-  -- Favorite mode parameters
-  params:add_separator("favorites", "FAVORITE MODES")
-  for i = 1, 4 do
-    params:add_trigger("load_fav_"..i, "Load FAV" .. i)
-    params:set_action("load_fav_"..i, function() load_favorite(i) end)
-
-    params:add_trigger("save_fav_"..i, "Save FAV" .. i)
-    params:set_action("save_fav_"..i, function() save_favorite(i) end)
-  end
-
-  -- Send initial state to SC engine
-  engine.in_level(1.0)
-  engine.out_level(1.0)
-  engine.tempo(clock.get_tempo())
-  send_mode()
-  send_params()
-
-  -- Set initial dirty flag
-  dirty = true
-  redraw()
+  beat_flash = 4
 end
 
--- ─── EFFECT MODE DISPLAY ──────────────────────────────────────
-function redraw()
-  if not dirty then return end
-  dirty = false
+local function run_seq()
+  while true do
+    clock.sync(RATE_DIVS[seq_rate])
+    if playing then
+      play_step()
+      step = step % 8 + 1
+    end
+  end
+end
 
-  screen.clear()
-  screen.level(15)
-  screen.move(64, 10)
-  screen.text_center("KASTLE2")
+------------------------------------------------------------
+-- SCREEN REDRAW TIMER
+------------------------------------------------------------
 
-  -- Mode name display (current selected effect)
-  screen.level(12)
-  screen.move(64, 22)
-  screen.text_center(effects[state.mode].name)
+local function run_redraw()
+  while true do
+    clock.sleep(1 / 15)
+    if beat_flash > 0 then beat_flash = beat_flash - 1 end
+    redraw()
+    if grid_connected then grid_redraw() end
+  end
+end
 
-  -- DJ Filter visualization
-  draw_dj_filter()
+------------------------------------------------------------
+-- FAVORITES
+------------------------------------------------------------
 
-  -- Parameter display
-  draw_parameters()
+local function save_favorite(slot)
+  favorites[slot] = {
+    mode = mode,
+    param1 = param1,
+    param2 = param2,
+    seq_pitch = {},
+    seq_gate = {},
+    lfo_shape = lfo_shape,
+    lfo_rate = lfo_rate,
+    lfo_depth = lfo_depth,
+    dj_filter = dj_filter,
+    seq_rate = seq_rate,
+  }
+  for i = 1, 8 do
+    favorites[slot].seq_pitch[i] = seq_pitch[i]
+    favorites[slot].seq_gate[i] = seq_gate[i]
+  end
+end
 
-  -- Favorite mode indicators
-  draw_favorites()
+local function load_favorite(slot)
+  local f = favorites[slot]
+  if not f then return end
+  mode = f.mode
+  param1 = f.param1
+  param2 = f.param2
+  lfo_shape = f.lfo_shape
+  lfo_rate = f.lfo_rate
+  lfo_depth = f.lfo_depth
+  dj_filter = f.dj_filter
+  seq_rate = f.seq_rate
+  for i = 1, 8 do
+    seq_pitch[i] = f.seq_pitch[i]
+    seq_gate[i] = f.seq_gate[i]
+  end
+  apply_mode()
+end
 
-  -- MIDI CC learn indicator
-  if state.fav_learn_mode then
-    screen.level(15)
-    screen.move(64, 50)
-    screen.text_center("WAITING FOR CC...")
+local function randomize_seq()
+  local scales = {
+    {0,2,3,5,7,8,10},
+    {0,2,4,5,7,9,11},
+    {0,3,5,6,7,10},
+  }
+  local sc = scales[math.random(1, 3)]
+  for i = 1, 8 do
+    local oct = math.random(0, 1) * 12
+    seq_pitch[i] = sc[math.random(1, #sc)] + oct
+    seq_gate[i] = (math.random() > 0.2) and 1 or 0
+  end
+end
+
+------------------------------------------------------------
+-- GRID
+------------------------------------------------------------
+
+local function grid_redraw()
+  if not g then return end
+  g:all(0)
+
+  -- row 1: mode selector (9 buttons)
+  for i = 1, 9 do
+    g:led(i, 1, (i == mode) and 15 or 3)
   end
 
-  -- Popup notification
-  if popup_time > 0 then
-    screen.level(12)
-    screen.move(64, 56)
-    screen.text_center(popup_msg)
+  -- rows 2-3: sequence pitch display
+  for i = 1, 8 do
+    local hi = (seq_pitch[i] >= 12) and 1 or 0
+    local brightness = (i == step and playing) and 15 or 6
+    if hi == 1 then
+      g:led(i, 2, brightness)
+      g:led(i, 3, 2)
+    else
+      g:led(i, 2, 2)
+      g:led(i, 3, brightness)
+    end
+  end
+
+  -- row 4: gate toggles
+  for i = 1, 8 do
+    g:led(i, 4, seq_gate[i] == 1 and 10 or 2)
+  end
+
+  -- row 5: lfo shape (1-4) + rate (9-16)
+  for i = 1, 4 do
+    g:led(i, 5, (i == lfo_shape) and 12 or 3)
+  end
+  local rate_led = util.clamp(math.floor(lfo_rate / 10 * 8) + 9, 9, 16)
+  for i = 9, 16 do
+    g:led(i, 5, (i <= rate_led) and 8 or 2)
+  end
+
+  -- row 6: favorites (8 slots)
+  for i = 1, 8 do
+    local br = 2
+    if favorites[i] then br = 6 end
+    if i == fav_slot then br = 15 end
+    g:led(i, 6, br)
+  end
+
+  -- row 7: dj filter position (16 steps)
+  local dj_pos = math.floor(dj_filter / 100 * 15) + 1
+  for i = 1, 16 do
+    if i == dj_pos then
+      g:led(i, 7, 15)
+    elseif i == 8 or i == 9 then
+      g:led(i, 7, 4)
+    else
+      g:led(i, 7, 1)
+    end
+  end
+
+  -- row 8: transport + rate
+  g:led(1, 8, playing and 15 or 4)
+  for i = 3, 6 do
+    g:led(i, 8, (i - 2 == seq_rate) and 12 or 3)
+  end
+
+  g:refresh()
+end
+
+function g.key(x, y, z)
+  if z == 0 then return end
+
+  if y == 1 and x >= 1 and x <= 9 then
+    mode = x
+    apply_mode()
+  elseif y == 4 and x >= 1 and x <= 8 then
+    seq_gate[x] = 1 - seq_gate[x]
+  elseif y == 5 and x >= 1 and x <= 4 then
+    lfo_shape = x
+  elseif y == 5 and x >= 9 and x <= 16 then
+    lfo_rate = (x - 8) / 8 * 10
+  elseif y == 6 and x >= 1 and x <= 8 then
+    fav_slot = x
+    load_favorite(x)
+  elseif y == 7 and x >= 1 and x <= 16 then
+    dj_filter = (x - 1) / 15 * 100
+  elseif y == 8 and x == 1 then
+    playing = not playing
+    if playing then step = 1 end
+  elseif y == 8 and x >= 3 and x <= 6 then
+    seq_rate = x - 2
+  end
+end
+
+------------------------------------------------------------
+-- INIT
+------------------------------------------------------------
+
+function init()
+  -- midi setup
+  params:add_separator("kastle2", "KASTLE2")
+
+  params:add_number("midi_device", "midi device", 1, 16, 1)
+  params:set_action("midi_device", function(v)
+    midi_out_device = midi.connect(v)
+  end)
+  params:add_number("midi_channel", "midi channel", 1, 16, 1)
+  params:set_action("midi_channel", function(v) midi_out_channel = v end)
+
+  params:add_number("opxy_device", "op-xy device", 1, 16, 2)
+  params:set_action("opxy_device", function(v)
+    opxy_device = midi.connect(v)
+  end)
+  params:add_number("opxy_channel", "op-xy channel", 1, 16, 2)
+  params:set_action("opxy_channel", function(v) opxy_channel = v end)
+
+  params:add_number("root_note", "root note", 24, 72, 48)
+  params:set_action("root_note", function(v) seq_root = v end)
+
+  params:add_number("lfo_depth_param", "lfo depth", 0, 100, 50)
+  params:set_action("lfo_depth_param", function(v) lfo_depth = v end)
+
+  -- connect devices
+  midi_out_device = midi.connect(params:get("midi_device"))
+  opxy_device = midi.connect(params:get("opxy_device"))
+
+  -- init engine
+  apply_mode()
+
+  -- grid
+  grid_connected = (g and g.device ~= nil)
+
+  -- init favorites
+  for i = 1, 8 do favorites[i] = nil end
+
+  -- start clocks
+  table.insert(clock_ids, clock.run(run_seq))
+  table.insert(clock_ids, clock.run(run_lfo))
+  table.insert(clock_ids, clock.run(run_redraw))
+end
+
+------------------------------------------------------------
+-- INPUT
+------------------------------------------------------------
+
+function enc(n, d)
+  if n == 1 then
+    if k1_held then return end
+    mode = util.clamp(mode + d, 1, 9)
+    apply_mode()
+  elseif n == 2 then
+    if k1_held then
+      lfo_rate = util.clamp(lfo_rate + d * 0.2, 0.1, 20)
+    else
+      param1 = util.clamp(param1 + d, 0, 100)
+      apply_mode()
+    end
+  elseif n == 3 then
+    if k1_held then
+      dj_filter = util.clamp(dj_filter + d, 0, 100)
+    else
+      param2 = util.clamp(param2 + d, 0, 100)
+      apply_mode()
+    end
+  end
+end
+
+function key(n, z)
+  if n == 1 then
+    k1_held = (z == 1)
+    return
+  end
+
+  if z == 0 then return end
+
+  if k1_held then
+    if n == 2 then
+      save_favorite(fav_slot)
+    elseif n == 3 then
+      fav_slot = fav_slot % 8 + 1
+      load_favorite(fav_slot)
+    end
+  else
+    if n == 2 then
+      playing = not playing
+      if playing then step = 1 end
+    elseif n == 3 then
+      randomize_seq()
+    end
+  end
+end
+
+------------------------------------------------------------
+-- SCREEN
+------------------------------------------------------------
+
+function redraw()
+  screen.clear()
+  screen.aa(0)
+  screen.font_face(1)
+
+  -- top: mode name
+  screen.level(15)
+  screen.font_size(12)
+  screen.move(64, 10)
+  screen.text_center(MODE_NAMES[mode])
+
+  -- param values
+  screen.font_size(8)
+  screen.level(8)
+  screen.move(2, 20)
+  screen.text(MODE_P1[mode] .. ":" .. param1)
+  screen.move(126, 20)
+  screen.text_right(MODE_P2[mode] .. ":" .. param2)
+
+  -- sequence visualization (y=28 to y=42)
+  local seq_y = 34
+  for i = 1, 8 do
+    local x = 8 + (i - 1) * 15
+    -- step background
+    if i == step and playing then
+      screen.level(beat_flash > 0 and 15 or 10)
+    else
+      screen.level(seq_gate[i] == 1 and 6 or 2)
+    end
+    -- pitch bar
+    local bar_h = math.floor(seq_pitch[i] / 24 * 14) + 2
+    screen.rect(x, seq_y - bar_h, 11, bar_h)
+    screen.fill()
+    -- gate dot
+    if seq_gate[i] == 0 then
+      screen.level(2)
+      screen.rect(x + 4, seq_y + 1, 3, 2)
+      screen.fill()
+    end
+  end
+
+  -- divider line
+  screen.level(2)
+  screen.move(0, 38)
+  screen.line(128, 38)
+  screen.stroke()
+
+  -- bottom section: lfo mini waveform
+  screen.level(6)
+  local lfo_x = 2
+  local lfo_y_base = 52
+  for i = 0, 24 do
+    local p = i / 24
+    local val = 0
+    if lfo_shape == 1 then
+      val = math.sin(p * 2 * math.pi)
+    elseif lfo_shape == 2 then
+      if p < 0.5 then val = p * 4 - 1
+      else val = 3 - p * 4 end
+    elseif lfo_shape == 3 then
+      val = p * 2 - 1
+    else
+      if p < 0.5 then val = 1 else val = -1 end
+    end
+    screen.pixel(lfo_x + i, lfo_y_base - math.floor(val * 5))
+  end
+  screen.fill()
+
+  -- lfo label
+  screen.level(4)
+  screen.font_size(8)
+  screen.move(2, 62)
+  screen.text(LFO_SHAPES[lfo_shape])
+
+  -- dj filter bar (center = neutral)
+  local filt_x = 38
+  local filt_w = 50
+  local filt_center = filt_x + filt_w / 2
+  local filt_pos = filt_x + math.floor(dj_filter / 100 * filt_w)
+  screen.level(3)
+  screen.rect(filt_x, 56, filt_w, 3)
+  screen.fill()
+  screen.level(15)
+  screen.rect(filt_pos - 1, 54, 3, 7)
+  screen.fill()
+  -- center mark
+  screen.level(6)
+  screen.pixel(filt_center, 60)
+  screen.fill()
+
+  -- filter label
+  screen.level(4)
+  screen.move(52, 52)
+  if dj_filter < 45 then
+    screen.text_center("LP")
+  elseif dj_filter > 55 then
+    screen.text_center("HP")
+  else
+    screen.text_center("--")
+  end
+
+  -- bpm + rate
+  screen.level(8)
+  screen.move(126, 48)
+  screen.text_right(RATE_NAMES[seq_rate])
+  screen.move(126, 56)
+  screen.text_right(math.floor(params:get("clock_tempo")) .. "bpm")
+
+  -- play state + fav
+  screen.move(126, 62)
+  screen.level(playing and 15 or 4)
+  screen.text_right(playing and ">" or "||")
+
+  -- favorite slot indicator
+  screen.level(favorites[fav_slot] and 10 or 3)
+  screen.move(100, 62)
+  screen.text_right("F" .. fav_slot)
+
+  -- beat pulse
+  if beat_flash > 2 then
+    screen.level(15)
+    screen.rect(0, 0, 2, 2)
+    screen.fill()
   end
 
   screen.update()
 end
 
-function draw_dj_filter()
-  -- Visualize frequency sweep using delay mix as reference
-  local mix = state.effect_params[state.mode][3]
-  local freq_y = 30 + (mix * 10)
-
-  screen.level(8)
-  screen.rect(10, 30, 108, 15)
-  screen.stroke()
-
-  screen.level(12)
-  screen.move(10, freq_y)
-  screen.line(118, freq_y)
-  screen.stroke()
-
-  -- Frequency markers
-  screen.level(4)
-  for x = 10, 118, 27 do
-    screen.move(x, 25)
-    screen.line(x, 46)
-    screen.stroke()
-  end
-end
-
-function draw_parameters()
-  local effect = effects[state.mode]
-  local params = state.effect_params[state.mode]
-
-  screen.level(8)
-  screen.move(2, 58)
-
-  for i, param_name in ipairs(effect.params) do
-    local val = params[i]
-    local label = string.format("%s: %.2f", param_name, val)
-    if i == state.param_index then
-      screen.level(15)
-    else
-      screen.level(4)
-    end
-    screen.move(2 + (i-1) * 40, 58)
-    screen.text(label)
-  end
-end
-
-function draw_favorites()
-  -- Show favorite mode indicators
-  screen.level(4)
-  for i = 1, 4 do
-    local x = 20 + (i-1) * 27
-    local bright = (i == selected_fav) and 12 or 4
-    screen.level(bright)
-    screen.move(x, 44)
-    screen.text_center(favorite_names[i])
-  end
-end
-
--- ─── ENCODER CONTROL ──────────────────────────────────────────
-function enc(n, d)
-  if n == 1 then
-    -- E1: rotate to navigate modes
-    state.mode = ((state.mode - 1 + d) % 9) + 1
-    state.param_index = 1
-    send_mode()
-    send_params()
-    mark_redraw()
-  elseif n == 2 then
-    -- E2: navigate parameters
-    state.param_index = ((state.param_index - 1 + d) % 3) + 1
-    mark_redraw()
-  elseif n == 3 then
-    -- E3: adjust parameter value
-    local idx = state.param_index
-    local new_val = util.clamp(state.effect_params[state.mode][idx] + d * 0.01, 0, 1)
-    state.effect_params[state.mode][idx] = new_val
-    if idx == 1 then engine.p1(new_val)
-    elseif idx == 2 then engine.p2(new_val)
-    elseif idx == 3 then send_filter(new_val)
-    end
-    mark_redraw()
-  end
-end
-
--- ─── KEY CONTROL ──────────────────────────────────────────────
-function key(n, z)
-  if n == 1 then
-    k1_held = (z == 1)
-    return
-  elseif n == 2 and z == 1 then
-    if k1_held then
-      -- K1+K2: favorite mode manager
-      show_popup("SELECT FAVORITE")
-      return
-    end
-    -- K2: previous mode
-    state.mode = ((state.mode - 2) % 9) + 1
-    send_mode()
-    send_params()
-    mark_redraw()
-  elseif n == 3 and z == 1 then
-    -- K3: next mode
-    state.mode = (state.mode % 9) + 1
-    send_mode()
-    send_params()
-    mark_redraw()
-  end
-end
-
--- ─── GRID INTERFACE ───────────────────────────────────────────
-function grid_key(x, y, z)
-  if z == 1 then
-    -- Grid press: select effect mode (row 1-3 = modes 1-9)
-    if y <= 3 then
-      local mode_idx = (y - 1) * 3 + x
-      if mode_idx >= 1 and mode_idx <= 9 then
-        state.mode = mode_idx
-        send_mode()
-        send_params()
-        mark_redraw()
-      end
-    elseif y == 4 then
-      -- Row 4: favorite mode controls
-      selected_fav = x
-      mark_redraw()
-    elseif y == 5 then
-      -- Row 5: MIDI CC learn mode toggle
-      if x == 1 then
-        state.fav_learn_mode = not state.fav_learn_mode
-        if state.fav_learn_mode then
-          show_popup("LEARN MODE ON")
-        else
-          show_popup("LEARN MODE OFF")
-        end
-      end
-    end
-  end
-end
-
-if g and g.device then
-  g.key = grid_key
-end
-
--- ─── MIDI CC LEARN ────────────────────────────────────────────
-function midi_handler(data)
-  local msg = midi.to_msg(data)
-
-  if state.fav_learn_mode and msg.type == "cc" then
-    -- Learn MIDI CC for favorite mode control
-    state.fav_learn_cc = msg.cc
-    show_popup("CC " .. msg.cc .. " MAPPED")
-    state.fav_learn_mode = false
-  end
-end
-
--- ─── FAVORITE MODES ───────────────────────────────────────────
-function save_favorite(slot)
-  state.fav_modes[slot] = {
-    mode = state.mode,
-    params = {state.effect_params[state.mode][1], state.effect_params[state.mode][2], state.effect_params[state.mode][3]}
-  }
-  show_popup("SAVED TO " .. favorite_names[slot])
-end
-
-function load_favorite(slot)
-  local fav = state.fav_modes[slot]
-  if fav then
-    state.mode = fav.mode
-    state.effect_params[state.mode] = {fav.params[1], fav.params[2], fav.params[3]}
-    send_mode()
-    send_params()
-    show_popup("LOADED " .. favorite_names[slot])
-    mark_redraw()
-  end
-end
-
--- ─── POPUP NOTIFICATION ───────────────────────────────────────
-function show_popup(msg)
-  popup_msg = msg
-  popup_time = 60  -- ~4s at 15 FPS
-  mark_redraw()
-end
-
--- ─── TEMPO SYNC ─────────────────────────────────────────────
-clock.transport.tempo_change = function(bpm)
-  engine.tempo(bpm)
-end
+------------------------------------------------------------
+-- CLEANUP
+------------------------------------------------------------
 
 function cleanup()
-  if screen_clock_id then clock.cancel(screen_clock_id) end
-  if state.midi_device then
-    state.midi_device.event = nil
+  playing = false
+  for i = 1, #clock_ids do
+    clock.cancel(clock_ids[i])
+  end
+  -- midi all notes off
+  if midi_out_device then
+    for ch = 1, 16 do
+      midi_out_device:cc(123, 0, ch)
+    end
+  end
+  if opxy_device then
+    for ch = 1, 16 do
+      opxy_device:cc(123, 0, ch)
+    end
+  end
+  -- grid clear
+  if g then
+    g:all(0)
+    g:refresh()
   end
 end
